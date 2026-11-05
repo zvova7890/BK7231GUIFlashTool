@@ -468,7 +468,7 @@ namespace BK7231Flasher
             AllDataReceivedBuffer = allDataReceivedBuffer;
 
             // Attach event handler
-            Port.DataReceived += new SerialDataReceivedEventHandler(Port_DataReceived);
+            AttachDataReceived();
 
             InProgress.Wait();
 
@@ -545,6 +545,60 @@ namespace BK7231Flasher
         /// </summary>
         /// <param name="sender"></param>
         /// <param name="e"></param>
+        // Mono (Linux/macOS) never raises SerialPort.DataReceived, so poll the port there instead.
+        private static readonly bool IsMono = Type.GetType("Mono.Runtime") != null;
+        private volatile bool DataPollActive;
+        private Thread DataPollThread;
+
+        private void AttachDataReceived()
+        {
+            if(!IsMono)
+            {
+                Port.DataReceived -= Port_DataReceived;
+                Port.DataReceived += Port_DataReceived;
+                return;
+            }
+            if(DataPollActive)
+                return;
+            DataPollActive = true;
+            DataPollThread = new Thread(DataPollLoop) { IsBackground = true, Name = "XMODEM poll" };
+            DataPollThread.Start();
+        }
+
+        private void DetachDataReceived()
+        {
+            if(!IsMono)
+            {
+                Port.DataReceived -= Port_DataReceived;
+                return;
+            }
+            DataPollActive = false;
+        }
+
+        private void DataPollLoop()
+        {
+            while(DataPollActive)
+            {
+                try
+                {
+                    if(Port.IsOpen && Port.BytesToRead > 0)
+                    {
+                        lock(ReceiverStateLock)
+                        {
+                            if(DataPollActive)
+                                ProcessReceivedData(Port);
+                        }
+                        continue;
+                    }
+                }
+                catch(Exception)
+                {
+                    // Port closed or reconfigured underneath us; keep polling until detached.
+                }
+                Thread.Sleep(1);
+            }
+        }
+
         private void Port_DataReceived(object sender, SerialDataReceivedEventArgs e)
         {
             lock (ReceiverStateLock)
@@ -1284,7 +1338,7 @@ namespace BK7231Flasher
             Aborted = true;
 
             // Detach event handler
-            Port.DataReceived -= Port_DataReceived;
+            DetachDataReceived();
 
             // If we are sending data, tell Sender not to expect any more responses from Receiver.
             // This has no ill effect if we are receiving instead.
@@ -1431,7 +1485,7 @@ namespace BK7231Flasher
                 SenderPacketResponseWatchdog.Change(SenderPacketRetryTimeoutMillisec, SenderPacketRetryTimeoutMillisec);
 
             // Attach event handler
-            Port.DataReceived += new SerialDataReceivedEventHandler(Port_DataReceived);
+            AttachDataReceived();
 
             // Wait here for file initiation byte to be received from Receiver
             if(!instant) WaitForResponseFromReceiver.WaitOne();
